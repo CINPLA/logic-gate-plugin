@@ -39,15 +39,19 @@
 
 
 LogicGate::LogicGate()
-    : GenericProcessor ("Logic Gate"),
-      m_logicOp(0),
-      m_outputChan(0),
-      m_window(DEF_WINDOW),
-      m_input1(-1),
-      m_input2(-1),
-      m_input1gate(false),
-      m_input2gate(false),
-      m_pulseDuration(2)
+    : GenericProcessor("Logic Gate"),
+    m_logicOp(0),
+    m_outputChan(0),
+    m_window(DEF_WINDOW),
+    m_input1(-1),
+    m_input2(-1),
+    m_input1gate(false),
+    m_input2gate(false),
+    m_pulseDuration(2),
+    A_ts(0),
+    B_ts(0),
+    turnOffEvent(nullptr),
+    nSamples(0)
 {
     setProcessorType (PROCESSOR_TYPE_FILTER);
 }
@@ -64,11 +68,34 @@ AudioProcessorEditor* LogicGate::createEditor()
 
 void LogicGate::createEventChannels()
 {
+    // grab a channel to look at source
+    const DataChannel* in = getDataChannel(0);
+
+    if (!in)
+    {
+        eventChannelPtr = nullptr;
+        return;
+    }
+
     EventChannel* ev = new EventChannel(EventChannel::TTL, 8, 1, CoreServices::getGlobalSampleRate(), this);
     ev->setName("Logic Gate TTL output" );
     ev->setDescription("Triggers when logic operator is satisfied.");
     ev->setIdentifier ("dataderived.logicgate.trigger");
-    eventChannelArray.add (ev);
+
+    // metadata storing source data channel
+
+    MetaDataDescriptor sourceChanDesc(MetaDataDescriptor::UINT16, 3, "Source Channel",
+        "Index at its source, Source processor ID and Sub Processor index of the channel that triggers this event", "source.channel.identifier.full");
+    MetaDataValue sourceChanVal(sourceChanDesc);
+    uint16 sourceInfo[3];
+    sourceInfo[0] = in->getSourceIndex();
+    sourceInfo[1] = in->getSourceNodeID();
+    sourceInfo[2] = in->getSubProcessorIdx();
+    sourceChanVal.setValue(static_cast<const uint16*>(sourceInfo));
+    ev->addMetaData(sourceChanDesc, sourceChanVal);
+
+
+    eventChannelPtr = eventChannelArray.add (ev);
 }
 
 void LogicGate::handleEvent (const EventChannel* eventInfo, const MidiMessage& event, int sampleNum)
@@ -80,6 +107,7 @@ void LogicGate::handleEvent (const EventChannel* eventInfo, const MidiMessage& e
         const int eventId       = ttl->getSourceIndex();
         const int sourceId      = ttl->getSourceID();
         const int eventChannel  = ttl->getChannel();
+        const int64 ts          = ttl->getTimestamp(); // Need to save exact timestamp of event for LFP viewer
 
         if (m_input1 != -1)
         {
@@ -89,6 +117,7 @@ void LogicGate::handleEvent (const EventChannel* eventInfo, const MidiMessage& e
             {
                 std::cout << "Received A " << std::endl;
                 A = true;
+                A_ts = ts;
 
                 if ((m_input1gate) || (!m_input1gate && !m_input2gate))
                     m_previousTime = Time::currentTimeMillis();
@@ -103,6 +132,8 @@ void LogicGate::handleEvent (const EventChannel* eventInfo, const MidiMessage& e
             {
                 std::cout << "Received B " << std::endl;
                 B = true;
+                B_ts = ts;
+
                 if ((m_input2gate) || (!m_input1gate && !m_input2gate))
                     m_previousTime = Time::currentTimeMillis();
             }
@@ -183,6 +214,16 @@ void LogicGate::process (AudioSampleBuffer& buffer)
     // implement logic
     m_currentTime = Time::currentTimeMillis();
     m_timePassed = float(m_currentTime - m_previousTime);
+
+    // turn off event from previous buffer if necessary
+    int64 bufferTs = CoreServices::getGlobalTimestamp();
+    nSamples = getNumSamples(0);
+    int turnoffOffset = turnOffEvent ? jmax(0, int(turnOffEvent->getTimestamp() - bufferTs)) : -1;
+    if (turnoffOffset >= 0 && turnoffOffset < nSamples) // is Off event in this buffer?
+    {
+        addEvent(eventChannelPtr, turnOffEvent, turnoffOffset);
+        turnOffEvent = nullptr;
+    }
 
     switch (m_logicOp)
     {
@@ -286,17 +327,33 @@ void LogicGate::process (AudioSampleBuffer& buffer)
 
 void LogicGate::triggerEvent()
 {
-    int64 timestamp = CoreServices::getGlobalTimestamp();
-    setTimestampAndSamples(timestamp, 0);
+    // On event
+    int64 ts;
+    A_ts > B_ts ? ts = A_ts : ts = B_ts; // which event happened later? Save ts as start of event.
+    int64 bufferTs = CoreServices::getGlobalTimestamp();
+    int64 tsOffset = ts - bufferTs; // How many samples from start of buffer
     uint8 ttlData = 1 << m_outputChan;
-    const EventChannel* chan = getEventChannel(getEventChannelIndex(0, getNodeId()));
-    TTLEventPtr event = TTLEvent::createTTLEvent(chan, timestamp, &ttlData, sizeof(uint8), m_outputChan);
-    addEvent(chan, event, 0);
+    TTLEventPtr event = TTLEvent::createTTLEvent(eventChannelPtr, ts, &ttlData, sizeof(uint8), m_outputChan);
+    addEvent(eventChannelPtr, event, tsOffset);
 
+    // Off event
     int eventDurationSamp = static_cast<int>(ceil(m_pulseDuration / 1000.0f * getSampleRate()));
     uint8 ttlDataOff = 0;
-    TTLEventPtr eventOff = TTLEvent::createTTLEvent(chan, timestamp + eventDurationSamp, &ttlDataOff, sizeof(uint8), m_outputChan);
-    addEvent(chan, eventOff, 0);
+    int64 eventTsOff = ts + eventDurationSamp;
+    int64 tsOffsetOff = tsOffset + eventDurationSamp;
+    TTLEventPtr eventOff = TTLEvent::createTTLEvent(eventChannelPtr, eventTsOff, &ttlDataOff, sizeof(uint8), m_outputChan);
+   
+    // Check if to do the turn off event now, or in a later buffer
+    if (tsOffsetOff <= nSamples)
+    {
+        // add event now
+        addEvent(eventChannelPtr, eventOff, tsOffsetOff);
+    }
+    else
+    {
+        // save for later
+        turnOffEvent = eventOff;
+    }
 }
 
 void LogicGate::addEventSource(EventSources s)
@@ -308,6 +365,7 @@ void LogicGate::clearEventSources()
 {
     m_sources.clear();
 }
+
 
 
 void LogicGate::saveCustomParametersToXml(XmlElement *parentElement)

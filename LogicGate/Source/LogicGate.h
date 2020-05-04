@@ -118,6 +118,7 @@ private:
     int m_outputChan;
     int m_window;
     Array<EventSources> m_sources;
+    EventChannel* eventChannelPtr;
 
     // Time
     float m_timePassed;
@@ -130,7 +131,14 @@ private:
     bool A;
     bool B;
 
+    // Save TS
+    int64 A_ts;
+    int64 B_ts;
+
+
     void triggerEvent();
+    TTLEventPtr turnOffEvent;
+    int nSamples;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (LogicGate);
 };
